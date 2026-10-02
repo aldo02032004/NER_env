@@ -80,13 +80,14 @@ def test_review_all_statuses_and_master_fields(tmp_path):
     assert by_text[DOCS["b"]]["entities"] == []
 
 
-def test_correction_rate_per_route_reason(tmp_path):
+def test_entity_metrics_per_route_reason(tmp_path):
     _, _, log = run(tmp_path, FakeLLM(ANSWERS))
     s = summarize_log(log)
-    assert s["low_score"]["correction_rate"] == 1.0          # Putin ditambah
-    assert s["no_entity_sample"]["correction_rate"] == 0.0
-    assert s["random_sample"]["correction_rate"] == 1.0      # Solo ditambah
-    assert s["no_entity_capital"]["missing"] == 1
+    low = s["low_score"]                                      # Prabowo dibenarkan, Putin ditambah
+    assert (low["kept"], low["dropped"], low["added"], low["precision"], low["recall"]) == (1, 0, 1, 1.0, 0.5)
+    assert s["no_entity_sample"]["precision"] is None and s["no_entity_sample"]["recall"] is None
+    assert s["random_sample"]["recall"] == 0.5                # Solo ditambah
+    assert s["no_entity_capital"]["missing"] == 1 and s["no_entity_capital"]["added"] == 1
     assert llm_entities(log)["d"] == {**{lab: [] for lab in CFG["labels"]}, "tokoh": ["Luhut Binsar"]}
 
 
@@ -124,3 +125,68 @@ def test_parse_fail_splits_then_marks_failed(tmp_path):
     assert len(master) == 3
     llm2 = FakeLLM(ANSWERS)
     assert run(tmp_path, llm2, cfg)[0] and llm2.calls == []   # failed tidak diulang
+
+
+def test_compare_entities_drop():
+    from ner.llm import compare_entities
+    assert compare_entities({"tokoh": ["Prabowo", "Menkeu"]}, {"tokoh": ["prabowo"], "lokasi": []}) == {
+        "kept": 1, "dropped": 1, "added": 0}
+
+
+class MinuteLimitLLM(FakeLLM):
+    """Kena limit per menit sekali, lalu normal lagi."""
+    def __call__(self, prompt):
+        if not getattr(self, "hit", False):
+            self.hit = True
+            raise RuntimeError("429 RESOURCE_EXHAUSTED Quota: GenerateRequestsPerMinutePerProjectPerModel")
+        return super().__call__(prompt)
+
+
+def test_minute_limit_waits_then_continues(tmp_path):
+    waits = []
+    master, log = tmp_path / "m.jsonl", tmp_path / "l.jsonl"
+    done = review_all(DOCS, PREDS, ROUTES, CFG, "p", MinuteLimitLLM(ANSWERS), master, log,
+                      sleep=waits.append, sleep_between=0)
+    assert done and 60 in waits and len(read_jsonl(log)) == 4
+
+
+def test_daily_quota_stops_without_waiting(tmp_path):
+    def daily_llm(prompt):
+        raise RuntimeError("429 RESOURCE_EXHAUSTED Quota: GenerateRequestsPerDayPerProjectPerModel-FreeTier")
+    waits = []
+    done = review_all(DOCS, PREDS, ROUTES, CFG, "p", daily_llm, tmp_path / "m.jsonl", tmp_path / "l.jsonl",
+                      sleep=waits.append, sleep_between=0)
+    assert not done and 60 not in waits
+
+
+def test_budget_and_low_score_priority(tmp_path):
+    docs = {f"d{i}": f"Prabowo bertemu Putin {i}" for i in range(4)}
+    preds = {f"d{i}": [[0, 7, "tokoh", s]] for i, s in enumerate([0.5, 0.2, 0.4, 0.3])}
+    routes = {d: "low_score" for d in docs}
+    answers = {t: {"tokoh": ["Prabowo"]} for t in docs.values()}
+    llm = FakeLLM(answers)
+    cfg = {**CFG, "batch_size": 1, "ai_workers": 1, "llm_budget_per_run": 2}
+    done = review_all(docs, preds, routes, cfg, "p", llm, tmp_path / "m.jsonl", tmp_path / "l.jsonl", **NO_SLEEP)
+    assert not done
+    assert [c[0] for c in llm.calls] == [docs["d1"], docs["d3"]]   # skor terendah dulu, maksimal 2 doc
+
+
+def test_make_generate_needs_key_and_uses_json_mode(monkeypatch):
+    from google import genai
+    from ner.llm import make_generate
+    with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
+        make_generate(CFG, api_key=None)
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, api_key):
+            seen["key"] = api_key
+            self.models = self
+
+        def generate_content(self, model, contents, config):
+            seen.update(model=model, mime=config.response_mime_type)
+            return type("R", (), {"text": "[]"})()
+
+    monkeypatch.setattr(genai, "Client", FakeClient)
+    assert make_generate(CFG, api_key="k")("halo") == "[]"
+    assert seen == {"key": "k", "model": "gemini-2.5-flash", "mime": "application/json"}

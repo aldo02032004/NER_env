@@ -83,6 +83,9 @@ DEFAULTS = {
     "no_entity_sample_rate": 0.1,     # sampel doc tanpa entitas & tanpa huruf kapital di tengah kalimat
     "batch_size": 40,
     "ai_workers": 2,
+    "llm_provider": "gemini_api",     # gemini_api (API key di Colab Secrets) | colab (google.colab.ai)
+    "llm_model": "gemini-2.5-flash",
+    "llm_budget_per_run": None,       # maksimal doc dikirim ke LLM per run (None = sampai kuota habis)
     "aliases": {},                    # {project: {variasi huruf kecil: nama baku}}, hanya untuk export
     "paths": {
         "master_data": f"{DRIVE_DIR}/master_ner.jsonl",
@@ -92,6 +95,7 @@ DEFAULTS = {
     },
 }
 DESCRIPTION_KEYS = {"deskripsi", "contoh_positif", "contoh_negatif", "aturan"}
+LLM_PROVIDERS = ("gemini_api", "colab")
 
 RE_LABEL = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -185,6 +189,13 @@ def validate_config(cfg):
     for key in ("batch_size", "ai_workers"):
         if key in cfg and not (_is_int(cfg[key]) and cfg[key] > 0):
             problems.append(f"{key} harus int > 0, dapat {cfg[key]!r}")
+    budget = cfg.get("llm_budget_per_run")
+    if budget is not None and not (_is_int(budget) and budget > 0):
+        problems.append(f"llm_budget_per_run harus null atau int > 0, dapat {budget!r}")
+    if "llm_provider" in cfg and cfg["llm_provider"] not in LLM_PROVIDERS:
+        problems.append(f"llm_provider harus salah satu {LLM_PROVIDERS}, dapat {cfg['llm_provider']!r}")
+    if "llm_model" in cfg and not (isinstance(cfg["llm_model"], str) and cfg["llm_model"].strip()):
+        problems.append("llm_model harus string tidak kosong")
 
     if "aliases" in cfg:
         aliases = cfg["aliases"]

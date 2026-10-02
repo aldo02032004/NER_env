@@ -29,7 +29,9 @@ File yang ditulis ke Drive (lokasinya diatur di `paths` pada config):
 | `checkpoints/llm_log_<project>.jsonl` | log Gemini per doc (status, entitas, koreksi), dipakai untuk resume |
 | `output/<project>_entities.pkl` / `.csv` | kolom asli + `doc_id`, `text`, `entities_<label>`, `ner_source` |
 
-Kalau kuota Gemini habis, jalankan ulang Cell ⑥. Doc yang sudah selesai tidak dikirim lagi.
+Gemini dipanggil lewat **API key sendiri**: buat di https://aistudio.google.com/apikey, simpan di Colab Secrets (ikon kunci) dengan nama `GOOGLE_API_KEY`, lalu nyalakan *Notebook access*. Jangan tempel key di notebook.
+
+Kalau kena limit per menit, Cell ⑥ menunggu 60 detik lalu lanjut sendiri. Kalau kuota harian habis, jalankan ulang Cell ⑥ besok: doc yang sudah selesai tidak dikirim lagi.
 
 ## Menjalankan test
 
@@ -61,6 +63,9 @@ Key yang perlu diedit:
 | `ner_review_threshold` | per model: doc dengan entitas di bawah skor ini dikirim ke Gemini (`low_score`) |
 | `review_sample_rate` | sampel doc berskor tinggi yang tetap dicek (`random_sample`) |
 | `no_entity_sample_rate` | sampel doc tanpa entitas dan tanpa huruf kapital di tengah kalimat (`no_entity_sample`) |
+| `llm_provider` | `gemini_api` (API key di Colab Secrets `GOOGLE_API_KEY`) atau `colab` (`google.colab.ai`, kuotanya sangat kecil) |
+| `llm_model` | nama model Gemini, default `gemini-2.5-flash` |
+| `llm_budget_per_run` | maksimal doc yang dikirim ke LLM per run (`null` = sampai kuota habis) |
 | `aliases` | `{project: {variasi: nama baku}}`, hanya dipakai untuk kolom export, tidak mengubah master |
 
 ### `ner.cleaning`: dari teks mentah ke teks master
@@ -125,4 +130,6 @@ Sampel ditentukan dari hash `doc_id`, jadi keputusannya selalu sama setiap kali 
 - Status per doc di log: `ok` (masuk master), `missing` (entitas tidak ketemu di teks), `conflict` (satu nama punya dua label), dan `failed`.
 - Kalau jawaban batch gagal di-parse 2 kali, doc di batch itu dikirim sendiri-sendiri. Kalau masih gagal, statusnya `failed` dan tidak diulang lagi.
 - Kalau kuota habis, proses berhenti. Semua hasil sebelumnya sudah tersimpan, dan saat dijalankan ulang hanya doc yang belum final yang dikirim.
-- `summarize_log` / `print_summary`: jumlah per status dan correction rate untuk setiap route_reason.
+- Urutan antrean: selang-seling per route_reason, dan `low_score` dimulai dari skor terendah (doc paling ragu paling berguna untuk latihan).
+- `summarize_log` / `print_summary`: per route_reason, jumlah per status dan perbandingan entitas model vs LLM:
+  `dibenarkan` / `dibuang` / `ditambah`, **presisi** (porsi entitas model yang dibenarkan LLM) dan **recall** (porsi entitas versi LLM yang sudah ditemukan model). Angka paling jujur ada di `random_sample`, karena doc lain dipilih justru karena ragu.
