@@ -62,7 +62,7 @@ tokoh, instansi\_pemerintah, partai, perusahaan, kebijakan, indikator\_ekonomi, 
 
 &#x20;"labels": \[label yang ditanyakan saat anotasi], "schema\_version": int,
 
-&#x20;"label\_source": "gemini" | "manual", "route\_reason": "low\_score" | "random\_sample" | "no\_entity",
+&#x20;"label\_source": "gemini" | "manual", "route\_reason": "low\_score" | "random\_sample" | "no\_entity\_capital" | "no\_entity\_sample",
 
 &#x20;"model\_version": str, "run\_date": "YYYY-MM-DD"}
 
