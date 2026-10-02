@@ -10,6 +10,8 @@ Aturan proyek dan format data master ada di [CLAUDE.md](CLAUDE.md).
 
 ## Melabeli data di Colab
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/aldo02032004/NER_env/blob/main/notebooks/01_label.ipynb)
+
 Buka [notebooks/01_label.ipynb](notebooks/01_label.ipynb) di Colab (Runtime T4 GPU), lalu ikuti petunjuk di cell pertama.
 Alurnya:
 
