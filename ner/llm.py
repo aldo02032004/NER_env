@@ -1,6 +1,6 @@
-"""Validasi NER oleh LLM (Gemini lewat google.colab.ai), per batch, bisa resume lewat log per doc_id.
+"""Validasi NER oleh LLM (Gemini), per batch, bisa resume lewat log per doc_id.
 
-`generate(prompt) -> str` selalu dioper dari notebook, jadi modul ini tidak meng-import google.colab.
+`review_all` menerima `generate(prompt) -> str`; buat dengan `make_generate(cfg, api_key)`.
 """
 import json
 import os
@@ -16,15 +16,42 @@ ANSWERED = ("ok", "missing", "conflict")     # LLM menjawab
 FINAL = ANSWERED + ("failed",)              # tidak dikirim ulang saat resume
 MAX_BATCH_FAILS = 2                         # setelah ini doc dikirim sendirian (batch 1)
 MAX_FAILS = 3                               # gagal lagi saat sendirian -> failed
+QUOTA_WAIT = 60                             # detik tunggu saat kena limit per menit
+MAX_QUOTA_WAITS = 3                         # kena limit beruntun sebanyak ini -> berhenti
 
 
 def log_path(cfg, project):
     return os.path.join(cfg["paths"]["checkpoint_dir"], f"llm_log_{project}.jsonl")
 
 
+def make_generate(cfg, api_key=None):
+    """Fungsi generate(prompt) -> str sesuai cfg['llm_provider']. Import dilakukan di sini (bukan di atas)
+    supaya test tidak butuh google.colab / google-genai."""
+    if cfg["llm_provider"] == "colab":
+        from google.colab import ai
+        model = f"google/{cfg['llm_model']}"
+        return lambda prompt: ai.generate_text(prompt, model_name=model)
+
+    if not api_key:
+        raise ValueError("[ERROR] llm_provider = gemini_api butuh API key (Colab Secrets: GOOGLE_API_KEY)")
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+
+    def generate(prompt):
+        return client.models.generate_content(model=cfg["llm_model"], contents=prompt, config=config).text
+    return generate
+
+
 def is_quota_error(e):
     msg = str(e).lower()
     return "429" in msg or "resource_exhausted" in msg or "quota" in msg
+
+
+def is_daily_quota(e):
+    """Kuota harian habis: menunggu semenit tidak ada gunanya."""
+    return "perday" in str(e).lower().replace("_", "")
 
 
 def parse_json_text(text):
@@ -98,8 +125,14 @@ def clean_entities(entities, labels):
     return out, n_unknown
 
 
-def _name_sets(names):
-    return {lab: sorted({n.strip().lower() for n in v}) for lab, v in names.items()}
+def _entity_set(names):
+    return {(lab, n.strip().lower()) for lab, v in names.items() for n in v}
+
+
+def compare_entities(model_names, llm_names):
+    """Entitas model vs LLM (per label, huruf kecil): dibenarkan, dibuang, ditambah LLM."""
+    m, g = _entity_set(model_names), _entity_set(llm_names)
+    return {"kept": len(m & g), "dropped": len(m - g), "added": len(g - m)}
 
 
 def review_all(docs, preds, routes, cfg, project, generate, master_path, log_path,
@@ -107,8 +140,9 @@ def review_all(docs, preds, routes, cfg, project, generate, master_path, log_pat
     """Kirim doc di `routes` ke LLM, tulis yang lolos ke master, catat semua ke log.
 
     docs {doc_id: text}, preds {doc_id: spans model}, routes {doc_id: route_reason}.
+    Urutan: selang-seling per route_reason, low_score dari skor terendah; dibatasi cfg['llm_budget_per_run'].
     Log per doc: status ok | missing | conflict | failed (final) atau parse_fail (dicoba lagi).
-    Return True kalau semua doc sudah final, False kalau berhenti karena kuota.
+    Return True kalau semua doc di routes sudah final.
     """
     labels = cfg["labels"]
     final, fails = set(), Counter()
@@ -152,43 +186,53 @@ def review_all(docs, preds, routes, cfg, project, generate, master_path, log_pat
                     schema_version=cfg["schema_version"]))
             log_rows.append({"doc_id": d, "status": status, "route_reason": routes[d],
                              "attempts": fails[d] + 1, "entities": ents, "missing": missing,
-                             "corrected": _name_sets(ents) != _name_sets(spans_to_names(text, preds[d], labels))})
+                             **compare_entities(spans_to_names(text, preds[d], labels), ents)})
             final.add(d)
 
-    order = interleave(routes)
-    todo = [d for d in order if d not in final]
-    print(f"[INFO] LLM: {len(final & set(routes))} doc sudah selesai sebelumnya, {len(todo)} doc tersisa")
-    workers = cfg["ai_workers"]
+    todo = [d for d in interleave(routes, preds) if d not in final]
+    budget = cfg.get("llm_budget_per_run")
+    print(f"[INFO] LLM ({cfg['llm_provider']}, {cfg['llm_model']}): {len(final & set(routes))} doc sudah selesai "
+          f"sebelumnya, {len(todo)} doc tersisa" + (f", run ini maksimal {budget} doc" if budget else ""))
+    todo = todo[:budget] if budget else todo
+    workers, quota_waits = cfg["ai_workers"], 0
     with ThreadPoolExecutor(workers) as pool:
         while True:
-            pending = [d for d in order if d not in final]
+            pending = [d for d in todo if d not in final]
             if not pending:
-                return True
+                done_all = all(d in final for d in routes)
+                if not done_all:
+                    print(f"[INFO] Batas llm_budget_per_run ({budget}) tercapai. Jalankan ulang untuk lanjut.")
+                return done_all
             normal = [d for d in pending if fails[d] < MAX_BATCH_FAILS]
             batches = ([normal[i:i + cfg["batch_size"]] for i in range(0, len(normal), cfg["batch_size"])]
                        + [[d] for d in pending if fails[d] >= MAX_BATCH_FAILS])
             for g in range(0, len(batches), workers):
                 group = batches[g:g + workers]
                 futures = [pool.submit(ask_batch, b) for b in group]
-                master_rows, log_rows, quota_hit = [], [], False
+                master_rows, log_rows, quota_err = [], [], None
                 for batch, fut in zip(group, futures):
                     try:
                         result = fut.result()
                     except Exception as e:
                         if not is_quota_error(e):
                             raise
-                        quota_hit = True   # batch ini tidak dicatat -> dikirim ulang saat resume
+                        quota_err = e   # batch ini tidak dicatat -> dikirim ulang
                         continue
                     handle(batch, result, master_rows, log_rows)
                 # master dulu, baru log: kalau mati di antaranya, batch diulang dan master tidak dobel
                 append_jsonl(master_path, master_rows, allowed_labels=labels)
                 append_jsonl(log_path, log_rows, key=None, validate=False)
-                done = len(final & set(routes))
-                print(f"[INFO] {done}/{len(routes)} doc selesai")
-                if quota_hit:
-                    print("[STOP] Kuota habis / rate limit. Semua hasil sebelumnya sudah tersimpan. "
-                          "Tunggu, (turunkan ai_workers), lalu jalankan ulang cell ini.")
-                    return False
+                print(f"[INFO] {len(final & set(routes))}/{len(routes)} doc selesai")
+                if quota_err is not None:
+                    if is_daily_quota(quota_err) or quota_waits >= MAX_QUOTA_WAITS:
+                        print(f"[STOP] Kuota habis ({str(quota_err)[:160]}). Semua hasil sebelumnya sudah "
+                              "tersimpan. Jalankan ulang cell ini setelah kuota pulih.")
+                        return False
+                    quota_waits += 1
+                    print(f"[WARN] Kena limit per menit, tunggu {QUOTA_WAIT}s ({quota_waits}/{MAX_QUOTA_WAITS})")
+                    sleep(QUOTA_WAIT)
+                    break   # susun ulang batch, yang kena limit dikirim lagi
+                quota_waits = 0
                 sleep(sleep_between)
 
 
@@ -198,7 +242,8 @@ def latest_by_doc(log_rows):
 
 
 def summarize_log(log_rows, routes=None):
-    """Ringkasan per route_reason: jumlah per status + correction rate (dari doc yang dijawab LLM)."""
+    """Ringkasan per route_reason: jumlah per status + perbandingan entitas model vs LLM.
+    presisi = porsi entitas model yang dibenarkan LLM; recall = porsi entitas LLM yang sudah ditemukan model."""
     rows = list(latest_by_doc(log_rows).values())
     if routes is not None:
         rows = [r for r in rows if r["doc_id"] in routes]
@@ -206,23 +251,24 @@ def summarize_log(log_rows, routes=None):
     for reason in sorted({r["route_reason"] for r in rows}):
         sub = [r for r in rows if r["route_reason"] == reason]
         answered = [r for r in sub if r["status"] in ANSWERED]
-        n_corr = sum(r["corrected"] for r in answered)
+        kept, dropped, added = (sum(r.get(k, 0) for r in answered) for k in ("kept", "dropped", "added"))
         summary[reason] = {**Counter(r["status"] for r in sub), "answered": len(answered),
-                           "corrected": n_corr,
-                           "correction_rate": n_corr / len(answered) if answered else None}
+                           "kept": kept, "dropped": dropped, "added": added,
+                           "precision": kept / (kept + dropped) if kept + dropped else None,
+                           "recall": kept / (kept + added) if kept + added else None}
     return summary
 
 
 def print_summary(summary):
-    print(f"{'route_reason':<18} {'dijawab':>8} {'ok':>6} {'missing':>8} {'conflict':>9} {'failed':>7} {'koreksi':>8}")
+    pct = lambda x: "-" if x is None else f"{x:.0%}"
+    print(f"{'route_reason':<18} {'dijawab':>7} {'ok':>5} {'missing':>7} {'conflict':>8} {'failed':>6} "
+          f"{'dibenarkan':>10} {'dibuang':>7} {'ditambah':>8} {'presisi':>7} {'recall':>6}")
     for reason, s in summary.items():
-        rate = "-" if s["correction_rate"] is None else f"{s['correction_rate']:.1%}"
-        print(f"{reason:<18} {s['answered']:>8} {s.get('ok', 0):>6} {s.get('missing', 0):>8} "
-              f"{s.get('conflict', 0):>9} {s.get('failed', 0):>7} {rate:>8}")
-    answered = sum(s["answered"] for s in summary.values())
-    corrected = sum(s["corrected"] for s in summary.values())
-    if answered:
-        print(f"[INFO] Total correction rate: {corrected / answered:.1%} dari {answered} doc")
+        print(f"{reason:<18} {s['answered']:>7} {s.get('ok', 0):>5} {s.get('missing', 0):>7} "
+              f"{s.get('conflict', 0):>8} {s.get('failed', 0):>6} {s['kept']:>10} {s['dropped']:>7} "
+              f"{s['added']:>8} {pct(s['precision']):>7} {pct(s['recall']):>6}")
+    print("[INFO] presisi = entitas model yang dibenarkan LLM; recall = entitas versi LLM yang sudah ditemukan model. "
+          "Angka paling jujur ada di random_sample (tidak dipilih karena ragu).")
 
 
 def llm_entities(log_rows):

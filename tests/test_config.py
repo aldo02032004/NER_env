@@ -75,3 +75,11 @@ def test_old_default_prompts_upgraded_but_edited_kept(tmp_path):
     edited = {**old_prompts, "partai": "parpol"}
     path.write_text(json.dumps({**DEFAULTS, "gliner_label_prompts": edited}), encoding="utf-8")
     assert load_config(str(path))["gliner_label_prompts"] == edited
+
+
+def test_llm_settings_validated():
+    cfg = {**copy.deepcopy(DEFAULTS), "llm_provider": "openai", "llm_budget_per_run": 0}
+    with pytest.raises(ValueError) as err:
+        validate_config(cfg)
+    assert "llm_provider" in str(err.value) and "llm_budget_per_run" in str(err.value)
+    validate_config({**copy.deepcopy(DEFAULTS), "llm_budget_per_run": 500})

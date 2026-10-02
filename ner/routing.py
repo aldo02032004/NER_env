@@ -41,9 +41,12 @@ def route(doc_id, text, spans, threshold, sample_rate, no_entity_sample_rate):
     return "random_sample" if unit_hash(doc_id, "sample") < sample_rate else None
 
 
-def interleave(routes):
-    """Urutan doc_id selang-seling per alasan, supaya tiap putaran kuota mencakup semua route_reason."""
+def interleave(routes, preds=None):
+    """Urutan doc_id selang-seling per alasan, supaya tiap putaran kuota mencakup semua route_reason.
+    Dengan preds: low_score diurutkan dari skor terendah (paling ragu = paling berguna untuk latihan)."""
     groups = [[d for d, r in routes.items() if r == reason] for reason in REASONS]
+    if preds is not None:
+        groups[REASONS.index("low_score")].sort(key=lambda d: doc_score(preds[d]))
     return [d for row in zip_longest(*groups) for d in row if d is not None]
 
 
