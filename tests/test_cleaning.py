@@ -41,3 +41,18 @@ def test_text_for_ner_pipeline():
 def test_is_media_account_reexport():
     assert is_media_account("siapa", "News")
     assert is_media_account("akunbaru", extra_accounts=["akunbaru"])
+
+
+def test_strip_noise_keeps_links_and_underscores():
+    out = strip_noise("cek https://t.co/abc 😂 @prabowo_subianto")
+    assert "https://t.co/abc" in out and "@prabowo_subianto" in out
+    assert "wajah gembira berurai air mata" in out
+
+
+def test_text_for_ner_removes_whole_link():
+    out = text_for_ner("Bensin dari batu bara? https://t.co/kijt0OfoiU")
+    assert "t.co" not in out and "//" not in out
+
+
+def test_fancy_unicode_normalized():
+    assert text_for_ner("seandainya 𝑴𝑩𝑮 𝒅𝒂𝒏 𝑲𝑫𝑴𝑷 distop") == "seandainya MBG dan KDMP distop"

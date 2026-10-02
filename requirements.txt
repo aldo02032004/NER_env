@@ -1,6 +1,8 @@
 # Python >= 3.11 (syarat paket great). Di-test lokal dengan Python 3.14.3.
-# torch/pandas/numpy bawaan Colab sengaja TIDAK di-pin: install ulang = wajib restart runtime.
+# torch/pandas/numpy/transformers bawaan Colab sengaja TIDAK di-pin: install ulang = wajib restart runtime.
 great[text] @ git+https://github.com/azmkto/GREAT-Tools.git@ce6e44a009280e56dec3aa4b6462e93b0b0d7cde
 emoji==2.16.0
 ftfy==6.3.1
+openpyxl==3.1.5
+gliner==0.2.29
 pytest==9.1.1

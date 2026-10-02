@@ -8,7 +8,7 @@ from datetime import date
 from ner.cleaning import dedup_key
 
 LABEL_SOURCES = ("gemini", "manual")
-ROUTE_REASONS = ("low_score", "random_sample", "no_entity")
+ROUTE_REASONS = ("low_score", "random_sample", "no_entity_capital", "no_entity_sample")
 RE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 FIELDS = {"doc_id": str, "project": str, "text": str, "entities": list, "labels": list,
           "schema_version": int, "label_source": str, "route_reason": str,
@@ -113,19 +113,23 @@ def _drop_partial_tail(path):
         f.truncate(cut)
 
 
-def append_jsonl(path, records, key="doc_id", allowed_labels=None):
-    """Append record valid yang key-nya belum ada. Aman diulang saat resume. Return jumlah ditulis."""
-    for rec in records:
+def append_jsonl(path, records, key="doc_id", allowed_labels=None, validate=True):
+    """Append record yang key-nya belum ada. Aman diulang saat resume. Return jumlah ditulis.
+    validate=False untuk file non-master (cache prediksi, log LLM). key=None = tanpa dedup."""
+    for rec in records if validate else ():
         errors = validate_record(rec, allowed_labels)
         if errors:
             raise ValueError(f"[ERROR] Record tidak valid ({rec.get('doc_id') if isinstance(rec, dict) else rec}): "
                              + "; ".join(errors))
-    seen = {r.get(key) for r in read_jsonl(path)}
-    new = []
-    for rec in records:
-        if rec[key] not in seen:
-            seen.add(rec[key])
-            new.append(rec)
+    if key is None:
+        new = list(records)
+    else:
+        seen = {r.get(key) for r in read_jsonl(path)}
+        new = []
+        for rec in records:
+            if rec[key] not in seen:
+                seen.add(rec[key])
+                new.append(rec)
     if not new:
         return 0
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

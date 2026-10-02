@@ -1,5 +1,6 @@
 """Cleaning teks. Cleaner utama dari paket `great` (jangan disalin ke sini)."""
 import re
+import unicodedata
 
 import emoji
 from great import clean_for_bert, clean_for_ner, is_media_account  # noqa: F401 (re-export)
@@ -15,10 +16,16 @@ def _blank(x):
     return x is None or x != x or str(x).strip().lower() in ("", "nan")   # x != x -> NaN
 
 
+def _emoji_to_words(chars, _data):
+    return " " + emoji.demojize(chars, language=EMOJI_LANG, delimiters=("", "")).replace("_", " ") + " "
+
+
 def strip_noise(text):
-    """Buang prefix RT & penanda [RE user], emoji -> kata, 'mantaaap' -> 'mantaap'."""
+    """Huruf hias -> biasa (NFKC), buang prefix RT & penanda [RE user], emoji -> kata, 'mantaaap' -> 'mantaap'.
+    Hanya karakter emoji yang diganti, jadi link (https://...) dan @user_name tetap utuh."""
+    text = unicodedata.normalize("NFKC", text)
     text = RE_REPLY.sub(" ", RE_RT_PREFIX.sub("", text))
-    text = emoji.demojize(text, language=EMOJI_LANG).replace("_", " ").replace(":", " ")
+    text = emoji.replace_emoji(text, replace=_emoji_to_words)
     return RE_ELONGATION.sub(r"\1\1", text)
 
 

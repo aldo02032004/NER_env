@@ -29,6 +29,15 @@ def entities_dict_to_spans(text, entities):
     return sorted(spans), missing
 
 
+def spans_to_names(text, spans, labels):
+    """Span ([s, e, label, (score)]) -> {label: [nama unik sesuai urutan kemunculan]} untuk semua labels."""
+    names = {lab: [] for lab in labels}
+    for s, e, label, *_ in sorted(spans):
+        if label in names and text[s:e] not in names[label]:
+            names[label].append(text[s:e])
+    return names
+
+
 def tokenize(text):
     """Teks -> list (start, end) karakter per token."""
     return [m.span() for m in RE_TOKEN.finditer(text)]
