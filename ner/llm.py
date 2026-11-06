@@ -1,6 +1,6 @@
 """Validasi NER oleh LLM lokal (GGUF via llama-cpp), per batch, bisa resume lewat log per doc_id.
 
-`review_all` menerima `generate(prompt) -> str`; buat dengan `make_generate(cfg)`.
+`review_all` menerima `generate(prompt, n) -> str` (n = jumlah doc di prompt); buat dengan `make_generate(cfg)`.
 """
 import json
 import os
@@ -14,34 +14,35 @@ ANSWERED = ("ok", "missing", "conflict")     # LLM menjawab
 FINAL = ANSWERED + ("failed",)              # tidak dikirim ulang saat resume
 MAX_BATCH_FAILS = 1                         # setelah ini doc dikirim sendirian (batch 1)
 MAX_FAILS = 2                               # gagal lagi saat sendirian -> failed
-TOKENS_PER_DOC = 150                        # batas jawaban per doc, supaya model tidak mengulang tanpa henti
+TOKENS_PER_DOC = 150                        # pengaman max_tokens per doc; panjang jawaban sudah dibatasi schema
+MAX_NAMES_PER_LABEL = 15                    # batas di schema: tanpa batas, model bisa menulis terus sampai terpotong
+MAX_NAME_CHARS = 80
 
 
 def log_path(cfg, project):
     return os.path.join(cfg["paths"]["checkpoint_dir"], f"llm_log_{project}.jsonl")
 
 
-def answer_schema(labels):
-    """JSON schema jawaban: array {index, entities: {label: [nama]}}. Dipakai llama-cpp sebagai grammar."""
-    names = {"type": "array", "items": {"type": "string"}}
+def answer_schema(labels, n):
+    """JSON schema jawaban: tepat n objek {index, entities: {label: [nama]}}. Dipakai llama-cpp sebagai grammar."""
+    names = {"type": "array", "items": {"type": "string", "maxLength": MAX_NAME_CHARS}, "maxItems": MAX_NAMES_PER_LABEL}
     entities = {"type": "object", "properties": {lab: names for lab in labels}, "required": list(labels)}
     item = {"type": "object", "properties": {"index": {"type": "integer"}, "entities": entities},
             "required": ["index", "entities"]}
-    return {"type": "array", "items": item}
+    return {"type": "array", "items": item, "minItems": n, "maxItems": n}
 
 
 def make_generate(cfg):
-    """Muat model GGUF dari Hugging Face, return generate(prompt) -> str.
+    """Muat model GGUF dari Hugging Face, return generate(prompt, n) -> str.
     Import di sini supaya test tidak butuh llama_cpp."""
     from llama_cpp import Llama
     llm = Llama.from_pretrained(repo_id=cfg["llm_model_repo"], filename=cfg["llm_model_file"],
                                 n_ctx=cfg["llm_n_ctx"], n_gpu_layers=-1, verbose=False)   # -1 = semua layer di GPU
-    fmt = {"type": "json_object", "schema": answer_schema(cfg["labels"])}
-    max_tokens = TOKENS_PER_DOC * cfg["batch_size"] + 200
 
-    def generate(prompt):
+    def generate(prompt, n):
+        fmt = {"type": "json_object", "schema": answer_schema(cfg["labels"], n)}
         out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}], response_format=fmt,
-                                         temperature=0, max_tokens=max_tokens)
+                                         temperature=0, max_tokens=TOKENS_PER_DOC * n + 200)
         return out["choices"][0]["message"]["content"]
     return generate
 
@@ -64,10 +65,10 @@ def order_by_index(parsed, n):
     return [by_idx[i] for i in range(1, n + 1)]
 
 
-def ask_json(generate, prompt, parse=lambda x: x):
+def ask_json(generate, prompt, n, parse=lambda x: x):
     """LLM -> JSON -> parse(). None kalau gagal (temperature 0: dicoba ulang pun jawabannya sama)."""
     try:
-        return parse(parse_json_text(generate(prompt)))
+        return parse(parse_json_text(generate(prompt, n)))
     except Exception as e:
         print(f"[WARN] Jawaban LLM tidak valid: {str(e)[:200]}")
         return None
@@ -141,7 +142,7 @@ def review_all(docs, preds, routes, cfg, project, generate, master_path, log_pat
     def ask_batch(batch):
         items = [(docs[d], spans_to_names(docs[d], preds[d], labels)) for d in batch]
         parse = lambda p: [clean_entities(it.get("entities"), labels) for it in order_by_index(p, len(batch))]
-        return ask_json(generate, build_prompt(items, cfg), parse=parse)
+        return ask_json(generate, build_prompt(items, cfg), len(batch), parse=parse)
 
     def handle(batch, result):
         master_rows, log_rows = [], []

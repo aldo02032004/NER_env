@@ -132,7 +132,7 @@ Matching is case-insensitive and whole-word, and the longer name wins on overlap
 - `ner.io`: `load_sheet` merges several Sheets/Drive links, `prepare_frame` adds the flags above, and `build_export` builds the output table. Duplicates inherit the entities of the original post, and unchecked GLiNER entities are kept only above the review threshold.
 - `ner.predict`: `predict_all` runs GLiNER with chunking and a per-document cache.
 - `ner.routing`: `route_all` assigns each document a `route_reason`. Samples are chosen from a hash of `doc_id`, so the choice is the same on every run.
-- `ner.llm`: `make_generate` loads the GGUF model with llama-cpp and forces answers into a JSON schema. `review_all` sends batches to it. A batch that fails to parse is retried one document at a time, and a document that still fails is marked `failed`. The queue alternates between route reasons, and `low_score` starts with the lowest scores. `summarize_log` reports, per route, how many model entities the LLM confirmed, removed or added, together with precision and recall.
+- `ner.llm`: `make_generate` loads the GGUF model with llama-cpp and forces answers into a JSON schema with exactly one entry per document and bounded lengths, so answers are never cut off. `review_all` sends batches to it. A batch that fails to parse is retried one document at a time, and a document that still fails is marked `failed`. The queue alternates between route reasons, and `low_score` starts with the lowest scores. `summarize_log` reports, per route, how many model entities the LLM confirmed, removed or added, together with precision and recall.
 
 ## License
 

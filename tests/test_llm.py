@@ -38,8 +38,9 @@ class FakeLLM:
     def __init__(self, answers, broken=()):
         self.answers, self.broken, self.calls = answers, set(broken), []
 
-    def __call__(self, prompt):
+    def __call__(self, prompt, n):
         texts = re.findall(r'^\d+\. Teks: "(.*)"$', prompt, re.M)
+        assert len(texts) == n
         self.calls.append(texts)
         if self.broken & set(texts):
             return "maaf, saya tidak bisa"
@@ -142,11 +143,15 @@ def test_budget_and_low_score_priority(tmp_path):
     assert [c[0] for c in llm.calls] == [docs["d1"], docs["d3"]]   # skor terendah dulu, maksimal 2 doc
 
 
-def test_answer_schema_requires_every_label():
+def test_answer_schema_requires_every_label_and_bounds_length():
     from ner.llm import answer_schema
-    item = answer_schema(["tokoh", "lokasi"])["items"]
+    schema = answer_schema(["tokoh", "lokasi"], 3)
+    assert (schema["minItems"], schema["maxItems"]) == (3, 3)      # tepat satu jawaban per doc
+    item = schema["items"]
     assert item["required"] == ["index", "entities"]
     assert item["properties"]["entities"]["required"] == ["tokoh", "lokasi"]
+    names = item["properties"]["entities"]["properties"]["tokoh"]
+    assert "maxItems" in names and "maxLength" in names["items"]    # model tidak bisa menulis tanpa henti
 
 
 def test_make_generate_loads_gguf_and_forces_json(monkeypatch):
@@ -161,12 +166,13 @@ def test_make_generate_loads_gguf_and_forces_json(monkeypatch):
 
         def create_chat_completion(self, messages, response_format, temperature, max_tokens):
             seen.update(prompt=messages[0]["content"], fmt=response_format["type"], temperature=temperature,
-                        max_tokens=max_tokens, labels=response_format["schema"]["items"]["properties"]["entities"]["required"])
+                        max_tokens=max_tokens, n=response_format["schema"]["maxItems"],
+                        labels=response_format["schema"]["items"]["properties"]["entities"]["required"])
             return {"choices": [{"message": {"content": "[]"}}]}
 
     monkeypatch.setitem(sys.modules, "llama_cpp", types.SimpleNamespace(Llama=FakeLlama))
-    assert make_generate(CFG)("halo") == "[]"
+    assert make_generate(CFG)("halo", 2) == "[]"
     assert seen["load"] == {"repo_id": CFG["llm_model_repo"], "filename": CFG["llm_model_file"],
                             "n_ctx": CFG["llm_n_ctx"], "n_gpu_layers": -1, "verbose": False}
     assert (seen["prompt"], seen["fmt"], seen["temperature"], seen["labels"]) == ("halo", "json_object", 0, CFG["labels"])
-    assert seen["max_tokens"] == 150 * CFG["batch_size"] + 200
+    assert (seen["n"], seen["max_tokens"]) == (2, 150 * 2 + 200)
