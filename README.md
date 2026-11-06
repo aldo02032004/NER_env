@@ -1,135 +1,139 @@
-# NER_env
+# Indonesian Political-Economic NER
 
-NER politik-ekonomi Indonesia: GLiNER + validasi Gemini, distilasi ke IndoBERT.
-Aturan proyek dan format data master ada di [PROJECT_NOTES.md](PROJECT_NOTES.md).
+Named-entity recognition for Indonesian social-media posts about politics and the economy. GLiNER finds the entities, Gemini checks the uncertain ones, and every checked document becomes training data for a smaller IndoBERT model, so LLM calls go down over time.
 
-## Syarat
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/aldo02032004/NER_env/blob/main/notebooks/01_label_entities.ipynb)
 
-- **Python >= 3.11** (syarat paket `great`). Colab saat ini sudah memenuhi. Cek dengan `python --version`.
-- Install: `pip install -r requirements.txt`
+**Status:** stage 2 (labelling with GLiNER + Gemini) is done and tested. Stage 3 (training and evaluating IndoBERT on the collected data) is next.
 
-## Melabeli data di Colab
+## Entities
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/aldo02032004/NER_env/blob/main/notebooks/01_label.ipynb)
+`tokoh` (person) · `instansi_pemerintah` (government agency) · `partai` (political party) · `perusahaan` (company) · `kebijakan` (policy or programme) · `indikator_ekonomi` (economic indicator) · `nilai_uang` (money amount) · `lokasi` (location)
 
-Buka [notebooks/01_label.ipynb](notebooks/01_label.ipynb) di Colab (Runtime T4 GPU), lalu ikuti petunjuk di cell pertama.
-Alurnya:
+## How it works
 
 ```
-spreadsheet -> cleaning (siap_ner) -> GLiNER -> routing -> Gemini -> master JSONL (data latih)
-                                                                  -> output/<project>_entities.pkl/.csv
+spreadsheet → clean text → GLiNER → routing → Gemini check → master JSONL (training data)
+                                                           → output/<project>_entities.csv
 ```
 
-File yang ditulis ke Drive (lokasinya diatur di `paths` pada config):
+1. **Clean**: build one text per post, flag media accounts, retweets, very short posts and duplicates. No rows are dropped; each row gets a `siap_ner` (ready for NER) flag.
+2. **Predict**: GLiNER runs in batches. Long texts are split into overlapping chunks, and predictions are cached per document.
+3. **Route**: only documents worth checking go to Gemini:
 
-| File | Isi |
+   | route_reason | Sent when |
+   |---|---|
+   | `low_score` | an entity scores below the review threshold |
+   | `no_entity_capital` | no entity, but a capitalised word appears mid-sentence |
+   | `no_entity_sample` | no entity, picked in a small random sample |
+   | `random_sample` | high-scoring document, picked in a random sample (the honest accuracy check) |
+
+4. **Validate**: Gemini corrects the entities in batches. A document enters the training data only if every entity is found exactly in the text and no name has two labels. Runs resume after quota limits, and documents already finished are never re-sent.
+5. **Report and export**: precision and recall of GLiNER against Gemini per route, and a per-project table with the entities in one column per label.
+
+## Quick start (Google Colab)
+
+1. Create a Gemini API key at <https://aistudio.google.com/apikey> and save it in Colab **Secrets** as `GOOGLE_API_KEY` (enable *Notebook access*).
+2. Open the notebook with the badge above and select a **T4 GPU** runtime.
+3. Run cell ①, fill in the form in cell ② (project name and spreadsheet links), then **Runtime → Run cell and below**.
+
+Files are written to Google Drive (locations set in `paths` in the config):
+
+| File | Contents |
 |---|---|
-| `master_ner.jsonl` | data latih (format di PROJECT_NOTES.md), dipakai bersama semua proyek |
-| `checkpoints/preds_<project>_<model>_t<threshold>.jsonl` | cache prediksi GLiNER per doc |
-| `checkpoints/llm_log_<project>.jsonl` | log Gemini per doc (status, entitas, koreksi), dipakai untuk resume |
-| `output/<project>_entities.pkl` / `.csv` | kolom asli + `doc_id`, `text`, `entities_<label>`, `ner_source` |
+| `master_ner.jsonl` | training data shared by all projects (format in [PROJECT_NOTES.md](PROJECT_NOTES.md)) |
+| `checkpoints/preds_<project>_<model>_t<threshold>.jsonl` | cached GLiNER predictions |
+| `checkpoints/llm_log_<project>.jsonl` | Gemini log per document, used to resume |
+| `output/<project>_entities.pkl` / `.csv` | original columns + `doc_id`, `text`, `entities_<label>`, `ner_source` |
 
-Gemini dipanggil lewat **API key sendiri**: buat di https://aistudio.google.com/apikey, simpan di Colab Secrets (ikon kunci) dengan nama `GOOGLE_API_KEY`, lalu nyalakan *Notebook access*. Jangan tempel key di notebook.
+## Tests
 
-Kalau kena limit per menit, Cell ⑥ menunggu 60 detik lalu lanjut sendiri. Kalau kuota harian habis, jalankan ulang Cell ⑥ besok: doc yang sudah selesai tidak dikirim lagi.
-
-## Menjalankan test
+Requires Python ≥ 3.11.
 
 ```bash
+pip install -r requirements.txt
 python -m pytest -q
 ```
 
-## Modul `ner/`
+The 90 tests cover every pure function (cleaning, formats, schema, routing, config, LLM parsing) without a GPU or API key.
 
-### `ner.config`: config JSON di Drive
+## Project structure
+
+```
+NER_env/
+├── ner/                         # all logic, importable and tested
+├── notebooks/01_label_entities.ipynb
+├── tests/
+├── PROJECT_NOTES.md             # labels, master data format, rules
+└── requirements.txt
+```
+
+## Module reference
+
+### `ner.config`: config JSON on Drive
 
 ```python
 from ner.config import load_config, save_config
-cfg = load_config("/content/drive/MyDrive/ner/config.json")   # belum ada -> default ditulis dulu
+cfg = load_config("/content/drive/MyDrive/ner/config.json")   # missing -> defaults are written first
 cfg["batch_size"] = 20
-save_config(cfg, "/content/drive/MyDrive/ner/config.json")   # divalidasi dulu sebelum ditulis
+save_config(cfg, "/content/drive/MyDrive/ner/config.json")   # validated before writing
 ```
-Config yang salah melempar `ValueError` yang berisi **semua** masalahnya sekaligus, termasuk key yang salah ketik.
-Kalau config lama belum punya key baru, key itu diisi nilai default dan disimpan. Nilai yang sudah Anda ubah tetap dipertahankan.
 
-Key yang perlu diedit:
+An invalid config raises one `ValueError` that lists **every** problem, including misspelt keys. Keys added in newer versions are filled with defaults while your edited values are kept. Old default GLiNER prompts that were never edited are upgraded to English automatically.
 
-| Key | Isi |
+| Key | Meaning |
 |---|---|
-| `labels` | daftar label (draft) |
-| `label_descriptions` | per label: `deskripsi`, `contoh_positif`, `contoh_negatif`, `aturan`. Semuanya masuk ke prompt Gemini. |
-| `gliner_label_prompts` | per label: teks yang dikirim ke GLiNER. **Pakai bahasa Inggris** (default: "person", "political party", ...), karena GLiNER v2.1 tidak paham label bahasa Indonesia. Prompt default lama yang belum diedit otomatis diganti saat config di-load. Mengganti prompt = GLiNER memprediksi ulang (cache terpisah). |
-| `predict_threshold` | skor minimum entitas GLiNER yang disimpan |
-| `ner_review_threshold` | per model: doc dengan entitas di bawah skor ini dikirim ke Gemini (`low_score`) |
-| `review_sample_rate` | sampel doc berskor tinggi yang tetap dicek (`random_sample`) |
-| `no_entity_sample_rate` | sampel doc tanpa entitas dan tanpa huruf kapital di tengah kalimat (`no_entity_sample`) |
-| `llm_provider` | `gemini_api` (API key di Colab Secrets `GOOGLE_API_KEY`) atau `colab` (`google.colab.ai`, kuotanya sangat kecil) |
-| `llm_model` | nama model Gemini, default `gemini-2.5-flash` |
-| `llm_budget_per_run` | maksimal doc yang dikirim ke LLM per run (`null` = sampai kuota habis) |
-| `aliases` | `{project: {variasi: nama baku}}`, hanya dipakai untuk kolom export, tidak mengubah master |
+| `labels` | label list (draft) |
+| `label_descriptions` | per label: `deskripsi`, `contoh_positif`, `contoh_negatif`, `aturan`, all sent to Gemini |
+| `gliner_label_prompts` | per label: the text sent to GLiNER. **Use English** ("person", "political party", …): GLiNER v2.1 does not understand Indonesian labels. Changing a prompt re-runs predictions (separate cache). |
+| `predict_threshold` | minimum GLiNER score kept |
+| `ner_review_threshold` | per model: documents with an entity below this score go to Gemini (`low_score`) |
+| `review_sample_rate` | share of high-scoring documents still checked (`random_sample`) |
+| `no_entity_sample_rate` | share of entity-free documents without mid-sentence capitals that are checked (`no_entity_sample`) |
+| `llm_provider` | `gemini_api` (key in Colab Secrets) or `colab` (`google.colab.ai`, very small quota) |
+| `llm_model` | Gemini model name, default `gemini-2.5-flash` |
+| `llm_budget_per_run` | maximum documents sent per run (`null` = until the quota runs out) |
+| `aliases` | `{project: {variant: canonical name}}`, used only in the export |
 
-### `ner.cleaning`: dari teks mentah ke teks master
+### `ner.cleaning`: raw text → master text
 
 ```python
-from ner.cleaning import build_raw_text, is_retweet, text_for_ner, clean_for_bert, is_media_account, dedup_key
+from ner.cleaning import build_raw_text, text_for_ner
 raw = build_raw_text(row["Headline"], row["Mentions"])
-text = text_for_ner(raw)          # = clean_for_ner(strip_noise(raw)), satu-satunya jalur ke `text` master
+text = text_for_ner(raw)   # the only path to the master `text`
 ```
-`clean_for_ner`, `clean_for_bert`, dan `is_media_account` di-re-export dari paket `great`, bukan disalin.
 
-### `ner.schema`: record data master + JSONL
+### `ner.schema`: master records and JSONL
 
 ```python
-from ner.schema import make_record, validate_record, append_jsonl, read_jsonl
-rec = make_record(text, spans, labels=cfg["labels"], project="prabowo_vladivostok",
+from ner.schema import make_record, append_jsonl
+rec = make_record(text, spans, labels=cfg["labels"], project="my_project",
                   label_source="gemini", route_reason="low_score",
                   model_version=cfg["active_model"], schema_version=cfg["schema_version"])
-n = append_jsonl(cfg["paths"]["master_data"], [rec], allowed_labels=cfg["labels"])
+append_jsonl(cfg["paths"]["master_data"], [rec], allowed_labels=cfg["labels"])
 ```
-- `doc_id` = hash dari `dedup_key(text)`. Teks yang hanya beda tanda baca atau huruf besar-kecil dianggap dokumen yang sama.
-- `append_jsonl` aman diulang saat resume: `doc_id` yang sudah ada dilewati. Record yang tidak valid ditolak dengan `ValueError`. Baris terakhir yang terpotong karena runtime mati dibuang dengan `[WARN]`.
 
-### `ner.formats`: konversi entitas
+- `doc_id` is a hash of the normalised text, so texts that differ only in punctuation or case count as one document.
+- `append_jsonl` is safe to repeat: existing `doc_id`s are skipped, invalid records raise `ValueError`, and a last line cut off by a crashed runtime is dropped with a warning.
+
+### `ner.formats`: entity conversions
 
 ```python
-from ner.formats import entities_dict_to_spans, spans_to_bio, bio_to_spans, spans_to_gliner, gliner_to_spans
+from ner.formats import entities_dict_to_spans, spans_to_bio, spans_to_gliner
 spans, missing = entities_dict_to_spans(text, {"tokoh": ["Prabowo"], "lokasi": ["Rusia"]})
-if missing:
-    ...   # ada entitas LLM yang tidak ketemu di teks, atau satu nama punya dua label -> JANGAN masuk data latih
-tokens, tags, n_misaligned = spans_to_bio(text, spans)   # BIO per token (tokenizer = GLiNER)
-item, n_misaligned = spans_to_gliner(text, spans)       # {"tokenized_text", "ner": [[tok_start, tok_end_inklusif, label]]}
+tokens, tags, n_misaligned = spans_to_bio(text, spans)   # BIO tags with the GLiNER tokenizer
+item, n_misaligned = spans_to_gliner(text, spans)
 ```
-- Pencocokan entitas tidak peduli huruf besar-kecil dan harus kata utuh. Nama yang lebih panjang menang saat tumpang tindih.
-- `n_misaligned` > 0 berarti ada span yang batasnya tidak sejajar dengan token (misalnya "Jakarta" di dalam token "Jakarta-Bandung"). Span itu melebar ke batas token. Ini dilaporkan dengan `[WARN]`.
-- Evaluasi: ubah span gold dan span prediksi dengan `spans_to_bio` pada teks yang sama, lalu hitung dengan seqeval.
 
-### `ner.io`: spreadsheet dan export
+Matching is case-insensitive and whole-word, and the longer name wins on overlap. `n_misaligned > 0` means a span did not line up with token boundaries and was widened. For evaluation, convert gold and predicted spans with `spans_to_bio` on the same text and score with seqeval.
 
-- `load_sheet(links)`: satu atau lebih link Google Sheets/Drive (dipisah koma) digabung jadi satu DataFrame.
-- `prepare_frame(df)`: menambah kolom `text`, `doc_id`, `is_media`, `is_retweet`, `too_short`, `is_duplicate`, dan `siap_ner`. Tidak ada baris yang dibuang. Duplikat hanya dihitung di antara baris bukan media dan tidak terlalu pendek, jadi retweet dari post akun media tetap diproses.
-- `build_export(df, docs, preds, llm_ents, labels, aliases, min_score)`: menyusun tabel output. Baris duplikat (misalnya retweet) ikut entitas dari post aslinya. Entitas GLiNER yang belum dicek Gemini hanya dipakai kalau skornya >= `min_score` (notebook memakai threshold review). Variasi huruf besar-kecil ("prabowo" / "Prabowo") disatukan ke bentuk yang paling sering muncul.
+### `ner.io`, `ner.predict`, `ner.routing`, `ner.llm`
 
-### `ner.predict`: GLiNER
+- `ner.io`: `load_sheet` merges several Sheets/Drive links, `prepare_frame` adds the flags above, and `build_export` builds the output table. Duplicates inherit the entities of the original post, and unchecked GLiNER entities are kept only above the review threshold.
+- `ner.predict`: `predict_all` runs GLiNER with chunking and a per-document cache.
+- `ner.routing`: `route_all` assigns each document a `route_reason`. Samples are chosen from a hash of `doc_id`, so the choice is the same on every run.
+- `ner.llm`: `review_all` sends batches to Gemini. A batch that fails to parse twice is retried one document at a time, and a document that still fails is marked `failed`. The queue alternates between route reasons, and `low_score` starts with the lowest scores. `summarize_log` reports, per route, how many model entities Gemini confirmed, removed or added, together with precision and recall.
 
-`predict_all(model, docs, cfg, cache_path)` memakai `model.inference` (batch). Teks panjang dipotong sesuai `max_len` model, dengan potongan yang saling tumpang tindih. Kalau dua span bertabrakan, yang skornya lebih tinggi dipakai. Hasil disimpan per doc, jadi bisa di-resume.
+## License
 
-### `ner.routing`: doc mana yang dicek LLM
-
-| route_reason | Syarat |
-|---|---|
-| `low_score` | ada entitas dengan skor < `ner_review_threshold` |
-| `no_entity_capital` | tidak ada entitas, tapi ada kata berhuruf kapital yang bukan kata pertama kalimat |
-| `no_entity_sample` | tidak ada entitas, masuk sampel `no_entity_sample_rate` |
-| `random_sample` | skor tinggi, masuk sampel `review_sample_rate` |
-
-Sampel ditentukan dari hash `doc_id`, jadi keputusannya selalu sama setiap kali dijalankan.
-
-### `ner.llm`: validasi Gemini
-
-`review_all(docs, preds, routes, cfg, project, generate, master_path, log_path)`. Fungsi `generate(prompt) -> str` dioper dari notebook.
-- Status per doc di log: `ok` (masuk master), `missing` (entitas tidak ketemu di teks), `conflict` (satu nama punya dua label), dan `failed`.
-- Kalau jawaban batch gagal di-parse 2 kali, doc di batch itu dikirim sendiri-sendiri. Kalau masih gagal, statusnya `failed` dan tidak diulang lagi.
-- Kalau kuota habis, proses berhenti. Semua hasil sebelumnya sudah tersimpan, dan saat dijalankan ulang hanya doc yang belum final yang dikirim.
-- Urutan antrean: selang-seling per route_reason, dan `low_score` dimulai dari skor terendah (doc paling ragu paling berguna untuk latihan).
-- `summarize_log` / `print_summary`: per route_reason, jumlah per status dan perbandingan entitas model vs LLM:
-  `dibenarkan` / `dibuang` / `ditambah`, **presisi** (porsi entitas model yang dibenarkan LLM) dan **recall** (porsi entitas versi LLM yang sudah ditemukan model). Angka paling jujur ada di `random_sample`, karena doc lain dipilih justru karena ragu.
+MIT, see [LICENSE](LICENSE).
