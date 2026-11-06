@@ -2,8 +2,10 @@
 
 `review_all` menerima `generate(prompt, n) -> str` (n = jumlah doc di prompt); buat dengan `make_generate(cfg)`.
 """
+import ctypes
 import json
 import os
+import sys
 from collections import Counter
 
 from ner.formats import entities_dict_to_spans, spans_to_names
@@ -32,9 +34,21 @@ def answer_schema(labels, n):
     return {"type": "array", "items": item, "minItems": n, "maxItems": n}
 
 
+def load_cuda12():
+    """Wheel llama-cpp dibangun untuk CUDA 12, CUDA bawaan Colab bisa versi lain.
+    Muat libcudart/libcublas CUDA 12 dari pip dulu; tanpa ini error 'libcudart.so.12: cannot open'."""
+    import nvidia.cublas
+    import nvidia.cuda_runtime
+    for pkg, lib in [(nvidia.cuda_runtime, "libcudart.so.12"), (nvidia.cublas, "libcublasLt.so.12"),
+                     (nvidia.cublas, "libcublas.so.12")]:
+        ctypes.CDLL(f"{pkg.__path__[0]}/lib/{lib}", mode=ctypes.RTLD_GLOBAL)
+
+
 def make_generate(cfg):
     """Muat model GGUF dari Hugging Face, return generate(prompt, n) -> str.
     Import di sini supaya test tidak butuh llama_cpp."""
+    if sys.platform == "linux":
+        load_cuda12()
     from llama_cpp import Llama
     llm = Llama.from_pretrained(repo_id=cfg["llm_model_repo"], filename=cfg["llm_model_file"],
                                 n_ctx=cfg["llm_n_ctx"], n_gpu_layers=-1, verbose=False)   # -1 = semua layer di GPU

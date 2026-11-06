@@ -154,6 +154,24 @@ def test_answer_schema_requires_every_label_and_bounds_length():
     assert "maxItems" in names and "maxLength" in names["items"]    # model tidak bisa menulis tanpa henti
 
 
+def test_load_cuda12_preloads_runtime_and_cublas(monkeypatch):
+    from ner import llm
+    loaded = []
+    monkeypatch.setattr(llm.ctypes, "CDLL", lambda path, mode: loaded.append((path, mode)))
+    nvidia = types.ModuleType("nvidia")
+    for sub in ("cublas", "cuda_runtime"):
+        mod = types.ModuleType(f"nvidia.{sub}")
+        mod.__path__ = [f"/site/nvidia/{sub}"]
+        setattr(nvidia, sub, mod)
+        monkeypatch.setitem(sys.modules, f"nvidia.{sub}", mod)
+    monkeypatch.setitem(sys.modules, "nvidia", nvidia)
+    llm.load_cuda12()
+    assert [p for p, _ in loaded] == ["/site/nvidia/cuda_runtime/lib/libcudart.so.12",
+                                      "/site/nvidia/cublas/lib/libcublasLt.so.12",
+                                      "/site/nvidia/cublas/lib/libcublas.so.12"]   # Lt sebelum cublas
+    assert all(mode == llm.ctypes.RTLD_GLOBAL for _, mode in loaded)
+
+
 def test_make_generate_loads_gguf_and_forces_json(monkeypatch):
     from ner.llm import make_generate
     seen = {}
@@ -171,6 +189,7 @@ def test_make_generate_loads_gguf_and_forces_json(monkeypatch):
             return {"choices": [{"message": {"content": "[]"}}]}
 
     monkeypatch.setitem(sys.modules, "llama_cpp", types.SimpleNamespace(Llama=FakeLlama))
+    monkeypatch.setattr(sys, "platform", "win32")   # load_cuda12 hanya di Linux
     assert make_generate(CFG)("halo", 2) == "[]"
     assert seen["load"] == {"repo_id": CFG["llm_model_repo"], "filename": CFG["llm_model_file"],
                             "n_ctx": CFG["llm_n_ctx"], "n_gpu_layers": -1, "verbose": False}

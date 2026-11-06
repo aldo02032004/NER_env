@@ -8,5 +8,7 @@ gliner==0.2.29
 # llama-cpp-python: wheel CUDA 12.4 siap pakai untuk Colab (Linux); di Windows/Mac dibangun dari source
 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 llama-cpp-python==0.3.36
+nvidia-cuda-runtime-cu12; sys_platform == "linux"   # libcudart.so.12 untuk wheel di atas
+nvidia-cublas-cu12; sys_platform == "linux"
 huggingface-hub
 pytest==9.1.1

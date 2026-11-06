@@ -54,7 +54,7 @@ pip install -r requirements.txt
 python -m pytest -q
 ```
 
-The 90 tests cover every pure function (cleaning, formats, schema, routing, config, LLM parsing) without a GPU or model download.
+The 91 tests cover every pure function (cleaning, formats, schema, routing, config, LLM parsing) without a GPU or model download.
 
 ## Project structure
 
