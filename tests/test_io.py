@@ -58,7 +58,7 @@ def test_build_export():
     out = build_export(df, docs, preds, llm, LABELS, aliases={"Wowo": "Prabowo Subianto"})
     assert list(out.columns) == ["Headline", "Mentions", "Author", "Media", "Followers", "doc_id", "text",
                                  "entities_tokoh", "entities_lokasi", "ner_source"]
-    assert out["ner_source"].fillna("-").tolist() == ["gliner", "gliner", "-", "gemini", "-"]   # retweet ikut post asli
+    assert out["ner_source"].fillna("-").tolist() == ["gliner", "gliner", "-", "llm", "-"]   # retweet ikut post asli
     assert out["entities_tokoh"][1] == ["Prabowo"] and out["entities_lokasi"][0] == ["Rusia"]
     assert out["entities_tokoh"][3] == ["Prabowo Subianto"]
     assert out["entities_tokoh"][2] == []

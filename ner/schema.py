@@ -7,7 +7,7 @@ from datetime import date
 
 from ner.cleaning import dedup_key
 
-LABEL_SOURCES = ("gemini", "manual")
+LABEL_SOURCES = ("llm", "manual", "gemini")   # gemini: data lama sebelum pindah ke LLM lokal
 ROUTE_REASONS = ("low_score", "random_sample", "no_entity_capital", "no_entity_sample")
 RE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 FIELDS = {"doc_id": str, "project": str, "text": str, "entities": list, "labels": list,

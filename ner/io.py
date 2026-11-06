@@ -96,7 +96,7 @@ def build_export(df, docs, preds, llm_ents, labels, aliases=None, min_score=0.0)
     per_doc = {}
     for d in docs:
         if d in llm_ents:
-            per_doc[d] = ({lab: llm_ents[d].get(lab, []) for lab in labels}, "gemini")
+            per_doc[d] = ({lab: llm_ents[d].get(lab, []) for lab in labels}, "llm")
         elif d in preds:
             trusted = [s for s in preds[d] if s[3] >= min_score]
             per_doc[d] = (spans_to_names(docs[d], trusted, labels), "gliner")

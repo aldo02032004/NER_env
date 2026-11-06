@@ -42,7 +42,7 @@ def route(doc_id, text, spans, threshold, sample_rate, no_entity_sample_rate):
 
 
 def interleave(routes, preds=None):
-    """Urutan doc_id selang-seling per alasan, supaya tiap putaran kuota mencakup semua route_reason.
+    """Urutan doc_id selang-seling per alasan, supaya run dengan llm_budget_per_run tetap mencakup semua alasan.
     Dengan preds: low_score diurutkan dari skor terendah (paling ragu = paling berguna untuk latihan)."""
     groups = [[d for d, r in routes.items() if r == reason] for reason in REASONS]
     if preds is not None:
@@ -63,6 +63,5 @@ def route_all(docs, preds, cfg):
     for reason in REASONS:
         print(f"       {reason:<18}: {counts[reason]}")
     print(f"       {'tidak dikirim':<18}: {len(docs) - len(routes)}")
-    print(f"[INFO] Perkiraan {math.ceil(len(routes) / cfg['batch_size'])} panggilan LLM "
-          f"(batch {cfg['batch_size']}, {cfg['ai_workers']} paralel)")
+    print(f"[INFO] Perkiraan {math.ceil(len(routes) / cfg['batch_size'])} panggilan LLM (batch {cfg['batch_size']})")
     return routes

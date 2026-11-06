@@ -81,11 +81,11 @@ DEFAULTS = {
     "ner_review_threshold": {"urchade/gliner_medium-v2.1": 0.6},   # skor di bawah ini dikirim ke LLM
     "review_sample_rate": 0.05,       # sampel acak skor tinggi yang tetap dicek LLM
     "no_entity_sample_rate": 0.1,     # sampel doc tanpa entitas & tanpa huruf kapital di tengah kalimat
-    "batch_size": 40,
-    "ai_workers": 2,
-    "llm_provider": "gemini_api",     # gemini_api (API key di Colab Secrets) | colab (google.colab.ai)
-    "llm_model": "gemini-2.5-flash",
-    "llm_budget_per_run": None,       # maksimal doc dikirim ke LLM per run (None = sampai kuota habis)
+    "batch_size": 10,                 # doc per panggilan LLM; harus muat di llm_n_ctx
+    "llm_model_repo": "faizonly5953/gemma2-9b-cpt-sahabatai-v1-instruct-GGUF",
+    "llm_model_file": "gemma2-9b-cpt-sahabatai-v1-instruct.q4_k_m.gguf",
+    "llm_n_ctx": 8192,                # panjang konteks (prompt + jawaban), dalam token
+    "llm_budget_per_run": None,       # maksimal doc dikirim ke LLM per run (None = semua)
     "aliases": {},                    # {project: {variasi huruf kecil: nama baku}}, hanya untuk export
     "paths": {
         "master_data": f"{DRIVE_DIR}/master_ner.jsonl",
@@ -95,7 +95,8 @@ DEFAULTS = {
     },
 }
 DESCRIPTION_KEYS = {"deskripsi", "contoh_positif", "contoh_negatif", "aturan"}
-LLM_PROVIDERS = ("gemini_api", "colab")
+REMOVED_KEYS = ("ai_workers", "llm_provider", "llm_model")   # dari versi Gemini, dibuang saat config dibaca
+OLD_BATCH_SIZE = 40               # default versi Gemini, terlalu besar untuk llm_n_ctx 8192
 
 RE_LABEL = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -186,16 +187,15 @@ def validate_config(cfg):
     for key in ("predict_threshold", "review_sample_rate", "no_entity_sample_rate"):
         if key in cfg and not _is_rate(cfg[key]):
             problems.append(f"{key} harus angka 0-1, dapat {cfg[key]!r}")
-    for key in ("batch_size", "ai_workers"):
+    for key in ("batch_size", "llm_n_ctx"):
         if key in cfg and not (_is_int(cfg[key]) and cfg[key] > 0):
             problems.append(f"{key} harus int > 0, dapat {cfg[key]!r}")
     budget = cfg.get("llm_budget_per_run")
     if budget is not None and not (_is_int(budget) and budget > 0):
         problems.append(f"llm_budget_per_run harus null atau int > 0, dapat {budget!r}")
-    if "llm_provider" in cfg and cfg["llm_provider"] not in LLM_PROVIDERS:
-        problems.append(f"llm_provider harus salah satu {LLM_PROVIDERS}, dapat {cfg['llm_provider']!r}")
-    if "llm_model" in cfg and not (isinstance(cfg["llm_model"], str) and cfg["llm_model"].strip()):
-        problems.append("llm_model harus string tidak kosong")
+    for key in ("llm_model_repo", "llm_model_file"):
+        if key in cfg and not (isinstance(cfg[key], str) and cfg[key].strip()):
+            problems.append(f"{key} harus string tidak kosong")
 
     if "aliases" in cfg:
         aliases = cfg["aliases"]
@@ -239,18 +239,32 @@ def load_config(path):
             cfg = json.load(f)
         except json.JSONDecodeError as e:
             raise ValueError(f"Config {path} bukan JSON valid: {e}") from None
+    removed = upgrade_from_gemini(cfg) if isinstance(cfg, dict) else []
     added = sorted(set(DEFAULTS) - set(cfg)) if isinstance(cfg, dict) else []
     for key in added:
         cfg[key] = copy.deepcopy(DEFAULTS[key])
     upgraded = upgrade_old_prompts(cfg)
     validate_config(cfg)
-    if added or upgraded:
+    if added or upgraded or removed:
         save_config(cfg, path)
+    if removed:
+        print(f"[INFO] Config versi Gemini diubah ke LLM lokal, key lama dibuang: {removed}")
     if added:
         print(f"[INFO] Key baru diisi nilai default dan disimpan ke {path}: {added}")
     if upgraded:
         print("[INFO] gliner_label_prompts masih default lama (bahasa Indonesia) -> diganti ke bahasa Inggris")
     return cfg
+
+
+def upgrade_from_gemini(cfg):
+    """Buang key versi Gemini; batch_size default lama ikut diganti. Return key yang dibuang."""
+    removed = [k for k in REMOVED_KEYS if k in cfg]
+    if removed:
+        for k in removed:
+            del cfg[k]
+        if cfg.get("batch_size") == OLD_BATCH_SIZE:
+            cfg["batch_size"] = DEFAULTS["batch_size"]
+    return removed
 
 
 def upgrade_old_prompts(cfg):

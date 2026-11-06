@@ -8,7 +8,7 @@ LABELS = ["tokoh", "lokasi"]
 
 
 def rec(text="Prabowo ke Rusia", entities=([0, 7, "tokoh"], [11, 16, "lokasi"]), **kw):
-    args = dict(labels=LABELS, project="p", label_source="gemini", route_reason="low_score",
+    args = dict(labels=LABELS, project="p", label_source="llm", route_reason="low_score",
                 model_version="m", schema_version=1, run_date="2026-09-30")
     return make_record(text, list(entities), **{**args, **kw})
 

@@ -25,9 +25,9 @@ def test_load_creates_default_then_roundtrip(tmp_path):
     path = str(tmp_path / "cfg" / "config.json")
     assert load_config(path) == DEFAULTS
     cfg = load_config(path)
-    cfg["batch_size"] = 10
+    cfg["batch_size"] = 7
     save_config(cfg, path)
-    assert load_config(path)["batch_size"] == 10
+    assert load_config(path)["batch_size"] == 7
 
 
 def test_old_config_gets_new_keys_without_losing_values(tmp_path):
@@ -60,8 +60,8 @@ def test_load_invalid_json(tmp_path):
 
 def test_load_invalid_values(tmp_path):
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({**DEFAULTS, "ai_workers": "2"}), encoding="utf-8")
-    with pytest.raises(ValueError, match="ai_workers"):
+    path.write_text(json.dumps({**DEFAULTS, "llm_n_ctx": "8192"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="llm_n_ctx"):
         load_config(str(path))
 
 
@@ -78,8 +78,22 @@ def test_old_default_prompts_upgraded_but_edited_kept(tmp_path):
 
 
 def test_llm_settings_validated():
-    cfg = {**copy.deepcopy(DEFAULTS), "llm_provider": "openai", "llm_budget_per_run": 0}
+    cfg = {**copy.deepcopy(DEFAULTS), "llm_model_file": " ", "llm_n_ctx": 0, "llm_budget_per_run": 0}
     with pytest.raises(ValueError) as err:
         validate_config(cfg)
-    assert "llm_provider" in str(err.value) and "llm_budget_per_run" in str(err.value)
+    for key in ("llm_model_file", "llm_n_ctx", "llm_budget_per_run"):
+        assert key in str(err.value)
     validate_config({**copy.deepcopy(DEFAULTS), "llm_budget_per_run": 500})
+
+
+def test_gemini_config_upgraded_to_local_llm(tmp_path):
+    path = tmp_path / "config.json"
+    old = {k: v for k, v in DEFAULTS.items() if not k.startswith("llm_model") and k != "llm_n_ctx"}
+    gemini = {**old, "batch_size": 40, "ai_workers": 2, "llm_provider": "gemini_api", "llm_model": "gemini-2.5-flash"}
+    path.write_text(json.dumps(gemini), encoding="utf-8")
+    cfg = load_config(str(path))
+    assert cfg == DEFAULTS                                   # key lama hilang, batch_size 40 -> 10
+    assert json.loads(path.read_text(encoding="utf-8")) == DEFAULTS
+
+    path.write_text(json.dumps({**gemini, "batch_size": 5}), encoding="utf-8")
+    assert load_config(str(path))["batch_size"] == 5         # batch_size yang diedit sendiri tetap

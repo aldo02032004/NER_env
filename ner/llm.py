@@ -1,12 +1,10 @@
-"""Validasi NER oleh LLM (Gemini), per batch, bisa resume lewat log per doc_id.
+"""Validasi NER oleh LLM lokal (GGUF via llama-cpp), per batch, bisa resume lewat log per doc_id.
 
-`review_all` menerima `generate(prompt) -> str`; buat dengan `make_generate(cfg, api_key)`.
+`review_all` menerima `generate(prompt) -> str`; buat dengan `make_generate(cfg)`.
 """
 import json
 import os
-import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 
 from ner.formats import entities_dict_to_spans, spans_to_names
 from ner.routing import interleave
@@ -14,48 +12,42 @@ from ner.schema import append_jsonl, make_record, read_jsonl
 
 ANSWERED = ("ok", "missing", "conflict")     # LLM menjawab
 FINAL = ANSWERED + ("failed",)              # tidak dikirim ulang saat resume
-MAX_BATCH_FAILS = 2                         # setelah ini doc dikirim sendirian (batch 1)
-MAX_FAILS = 3                               # gagal lagi saat sendirian -> failed
-QUOTA_WAIT = 60                             # detik tunggu saat kena limit per menit
-MAX_QUOTA_WAITS = 3                         # kena limit beruntun sebanyak ini -> berhenti
+MAX_BATCH_FAILS = 1                         # setelah ini doc dikirim sendirian (batch 1)
+MAX_FAILS = 2                               # gagal lagi saat sendirian -> failed
+TOKENS_PER_DOC = 150                        # batas jawaban per doc, supaya model tidak mengulang tanpa henti
 
 
 def log_path(cfg, project):
     return os.path.join(cfg["paths"]["checkpoint_dir"], f"llm_log_{project}.jsonl")
 
 
-def make_generate(cfg, api_key=None):
-    """Fungsi generate(prompt) -> str sesuai cfg['llm_provider']. Import dilakukan di sini (bukan di atas)
-    supaya test tidak butuh google.colab / google-genai."""
-    if cfg["llm_provider"] == "colab":
-        from google.colab import ai
-        model = f"google/{cfg['llm_model']}"
-        return lambda prompt: ai.generate_text(prompt, model_name=model)
+def answer_schema(labels):
+    """JSON schema jawaban: array {index, entities: {label: [nama]}}. Dipakai llama-cpp sebagai grammar."""
+    names = {"type": "array", "items": {"type": "string"}}
+    entities = {"type": "object", "properties": {lab: names for lab in labels}, "required": list(labels)}
+    item = {"type": "object", "properties": {"index": {"type": "integer"}, "entities": entities},
+            "required": ["index", "entities"]}
+    return {"type": "array", "items": item}
 
-    if not api_key:
-        raise ValueError("[ERROR] llm_provider = gemini_api butuh API key (Colab Secrets: GOOGLE_API_KEY)")
-    from google import genai
-    from google.genai import types
-    client = genai.Client(api_key=api_key)
-    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+
+def make_generate(cfg):
+    """Muat model GGUF dari Hugging Face, return generate(prompt) -> str.
+    Import di sini supaya test tidak butuh llama_cpp."""
+    from llama_cpp import Llama
+    llm = Llama.from_pretrained(repo_id=cfg["llm_model_repo"], filename=cfg["llm_model_file"],
+                                n_ctx=cfg["llm_n_ctx"], n_gpu_layers=-1, verbose=False)   # -1 = semua layer di GPU
+    fmt = {"type": "json_object", "schema": answer_schema(cfg["labels"])}
+    max_tokens = TOKENS_PER_DOC * cfg["batch_size"] + 200
 
     def generate(prompt):
-        return client.models.generate_content(model=cfg["llm_model"], contents=prompt, config=config).text
+        out = llm.create_chat_completion(messages=[{"role": "user", "content": prompt}], response_format=fmt,
+                                         temperature=0, max_tokens=max_tokens)
+        return out["choices"][0]["message"]["content"]
     return generate
 
 
-def is_quota_error(e):
-    msg = str(e).lower()
-    return "429" in msg or "resource_exhausted" in msg or "quota" in msg
-
-
-def is_daily_quota(e):
-    """Kuota harian habis: menunggu semenit tidak ada gunanya."""
-    return "perday" in str(e).lower().replace("_", "")
-
-
 def parse_json_text(text):
-    """JSON pertama di jawaban model (Colab AI tidak punya mode JSON)."""
+    """JSON pertama di jawaban model (jaga-jaga kalau ada teks di sekitarnya)."""
     starts = [i for i in (text.find("["), text.find("{")) if i >= 0]
     if not starts:
         raise ValueError("tidak ada JSON di jawaban model")
@@ -72,18 +64,13 @@ def order_by_index(parsed, n):
     return [by_idx[i] for i in range(1, n + 1)]
 
 
-def ask_json(generate, prompt, parse=lambda x: x, retry=2, sleep=time.sleep):
-    """LLM -> JSON -> parse(). Kuota habis langsung di-raise; None kalau semua retry gagal."""
-    for attempt in range(retry):
-        try:
-            return parse(parse_json_text(generate(prompt)))
-        except Exception as e:
-            if is_quota_error(e):
-                raise
-            wait = (20 if "503" in str(e) or "UNAVAILABLE" in str(e) else 5) * (attempt + 1)
-            print(f"[WARN] LLM gagal ({attempt + 1}/{retry}): {str(e)[:200]} -> tunggu {wait}s")
-            sleep(wait)
-    return None
+def ask_json(generate, prompt, parse=lambda x: x):
+    """LLM -> JSON -> parse(). None kalau gagal (temperature 0: dicoba ulang pun jawabannya sama)."""
+    try:
+        return parse(parse_json_text(generate(prompt)))
+    except Exception as e:
+        print(f"[WARN] Jawaban LLM tidak valid: {str(e)[:200]}")
+        return None
 
 
 def build_prompt(items, cfg):
@@ -135,8 +122,7 @@ def compare_entities(model_names, llm_names):
     return {"kept": len(m & g), "dropped": len(m - g), "added": len(g - m)}
 
 
-def review_all(docs, preds, routes, cfg, project, generate, master_path, log_path,
-               sleep=time.sleep, sleep_between=4):
+def review_all(docs, preds, routes, cfg, project, generate, master_path, log_path):
     """Kirim doc di `routes` ke LLM, tulis yang lolos ke master, catat semua ke log.
 
     docs {doc_id: text}, preds {doc_id: spans model}, routes {doc_id: route_reason}.
@@ -155,9 +141,10 @@ def review_all(docs, preds, routes, cfg, project, generate, master_path, log_pat
     def ask_batch(batch):
         items = [(docs[d], spans_to_names(docs[d], preds[d], labels)) for d in batch]
         parse = lambda p: [clean_entities(it.get("entities"), labels) for it in order_by_index(p, len(batch))]
-        return ask_json(generate, build_prompt(items, cfg), parse=parse, sleep=sleep)
+        return ask_json(generate, build_prompt(items, cfg), parse=parse)
 
-    def handle(batch, result, master_rows, log_rows):
+    def handle(batch, result):
+        master_rows, log_rows = [], []
         if result is None:
             for d in batch:
                 fails[d] += 1
@@ -165,9 +152,9 @@ def review_all(docs, preds, routes, cfg, project, generate, master_path, log_pat
                 log_rows.append({"doc_id": d, "status": status, "route_reason": routes[d], "attempts": fails[d]})
                 if status == "failed":
                     final.add(d)
-            print(f"[WARN] Batch {len(batch)} doc gagal di-parse, dicoba lagi "
-                  f"{'sendiri-sendiri' if len(batch) > 1 else '(atau ditandai failed)'}")
-            return
+            if len(batch) > 1:
+                print(f"[WARN] Batch {len(batch)} doc gagal di-parse, dicoba lagi satu per satu")
+            return master_rows, log_rows
         for d, (ents, n_unknown) in zip(batch, result):
             if n_unknown:
                 print(f"[WARN] {d}: {n_unknown} nama dengan label di luar config dibuang")
@@ -181,59 +168,36 @@ def review_all(docs, preds, routes, cfg, project, generate, master_path, log_pat
             status = "conflict" if conflict else "missing" if missing else "ok"
             if status == "ok":
                 master_rows.append(make_record(
-                    text, spans, labels=labels, project=project, label_source="gemini",
+                    text, spans, labels=labels, project=project, label_source="llm",
                     route_reason=routes[d], model_version=cfg["active_model"],
                     schema_version=cfg["schema_version"]))
             log_rows.append({"doc_id": d, "status": status, "route_reason": routes[d],
                              "attempts": fails[d] + 1, "entities": ents, "missing": missing,
                              **compare_entities(spans_to_names(text, preds[d], labels), ents)})
             final.add(d)
+        return master_rows, log_rows
 
     todo = [d for d in interleave(routes, preds) if d not in final]
     budget = cfg.get("llm_budget_per_run")
-    print(f"[INFO] LLM ({cfg['llm_provider']}, {cfg['llm_model']}): {len(final & set(routes))} doc sudah selesai "
+    print(f"[INFO] LLM ({cfg['llm_model_file']}): {len(final & set(routes))} doc sudah selesai "
           f"sebelumnya, {len(todo)} doc tersisa" + (f", run ini maksimal {budget} doc" if budget else ""))
     todo = todo[:budget] if budget else todo
-    workers, quota_waits = cfg["ai_workers"], 0
-    with ThreadPoolExecutor(workers) as pool:
-        while True:
-            pending = [d for d in todo if d not in final]
-            if not pending:
-                done_all = all(d in final for d in routes)
-                if not done_all:
-                    print(f"[INFO] Batas llm_budget_per_run ({budget}) tercapai. Jalankan ulang untuk lanjut.")
-                return done_all
-            normal = [d for d in pending if fails[d] < MAX_BATCH_FAILS]
-            batches = ([normal[i:i + cfg["batch_size"]] for i in range(0, len(normal), cfg["batch_size"])]
-                       + [[d] for d in pending if fails[d] >= MAX_BATCH_FAILS])
-            for g in range(0, len(batches), workers):
-                group = batches[g:g + workers]
-                futures = [pool.submit(ask_batch, b) for b in group]
-                master_rows, log_rows, quota_err = [], [], None
-                for batch, fut in zip(group, futures):
-                    try:
-                        result = fut.result()
-                    except Exception as e:
-                        if not is_quota_error(e):
-                            raise
-                        quota_err = e   # batch ini tidak dicatat -> dikirim ulang
-                        continue
-                    handle(batch, result, master_rows, log_rows)
-                # master dulu, baru log: kalau mati di antaranya, batch diulang dan master tidak dobel
-                append_jsonl(master_path, master_rows, allowed_labels=labels)
-                append_jsonl(log_path, log_rows, key=None, validate=False)
-                print(f"[INFO] {len(final & set(routes))}/{len(routes)} doc selesai")
-                if quota_err is not None:
-                    if is_daily_quota(quota_err) or quota_waits >= MAX_QUOTA_WAITS:
-                        print(f"[STOP] Kuota habis ({str(quota_err)[:160]}). Semua hasil sebelumnya sudah "
-                              "tersimpan. Jalankan ulang cell ini setelah kuota pulih.")
-                        return False
-                    quota_waits += 1
-                    print(f"[WARN] Kena limit per menit, tunggu {QUOTA_WAIT}s ({quota_waits}/{MAX_QUOTA_WAITS})")
-                    sleep(QUOTA_WAIT)
-                    break   # susun ulang batch, yang kena limit dikirim lagi
-                quota_waits = 0
-                sleep(sleep_between)
+    while True:
+        pending = [d for d in todo if d not in final]
+        if not pending:
+            done_all = all(d in final for d in routes)
+            if not done_all:
+                print(f"[INFO] Batas llm_budget_per_run ({budget}) tercapai. Jalankan ulang untuk lanjut.")
+            return done_all
+        normal = [d for d in pending if fails[d] < MAX_BATCH_FAILS]
+        batches = ([normal[i:i + cfg["batch_size"]] for i in range(0, len(normal), cfg["batch_size"])]
+                   + [[d] for d in pending if fails[d] >= MAX_BATCH_FAILS])
+        for batch in batches:
+            master_rows, log_rows = handle(batch, ask_batch(batch))
+            # master dulu, baru log: kalau mati di antaranya, batch diulang dan master tidak dobel
+            append_jsonl(master_path, master_rows, allowed_labels=labels)
+            append_jsonl(log_path, log_rows, key=None, validate=False)
+            print(f"[INFO] {len(final & set(routes))}/{len(routes)} doc selesai")
 
 
 def latest_by_doc(log_rows):

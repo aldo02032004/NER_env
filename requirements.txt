@@ -5,5 +5,8 @@ emoji==2.16.0
 ftfy==6.3.1
 openpyxl==3.1.5
 gliner==0.2.29
-google-genai==2.27.0
+# llama-cpp-python: wheel CUDA 12.4 siap pakai untuk Colab (Linux); di Windows/Mac dibangun dari source
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+llama-cpp-python==0.3.36
+huggingface-hub
 pytest==9.1.1

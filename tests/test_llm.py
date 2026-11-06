@@ -1,5 +1,7 @@
 import json
 import re
+import sys
+import types
 
 import pytest
 
@@ -8,8 +10,7 @@ from ner.llm import (build_prompt, llm_entities, order_by_index, parse_json_text
                      summarize_log)
 from ner.schema import read_jsonl, validate_record
 
-CFG = {**DEFAULTS, "batch_size": 2, "ai_workers": 2}
-NO_SLEEP = dict(sleep=lambda s: None, sleep_between=0)
+CFG = {**DEFAULTS, "batch_size": 2}
 
 
 def test_parse_json_text():
@@ -33,15 +34,13 @@ def test_prompt_contains_label_guidance():
 
 
 class FakeLLM:
-    """Jawab dari `answers` {text: entities}. `broken` = teks yang bikin jawaban batch rusak. `quota_after` n panggilan."""
-    def __init__(self, answers, broken=(), quota_after=None):
-        self.answers, self.broken, self.quota_after, self.calls = answers, set(broken), quota_after, []
+    """Jawab dari `answers` {text: entities}. `broken` = teks yang bikin jawaban batch rusak."""
+    def __init__(self, answers, broken=()):
+        self.answers, self.broken, self.calls = answers, set(broken), []
 
     def __call__(self, prompt):
         texts = re.findall(r'^\d+\. Teks: "(.*)"$', prompt, re.M)
         self.calls.append(texts)
-        if self.quota_after is not None and len(self.calls) > self.quota_after:
-            raise RuntimeError("429 RESOURCE_EXHAUSTED")
         if self.broken & set(texts):
             return "maaf, saya tidak bisa"
         return json.dumps([{"index": i, "entities": self.answers[t]} for i, t in enumerate(texts, 1)])
@@ -60,7 +59,7 @@ ANSWERS = {
 
 def run(tmp_path, llm, cfg=CFG, routes=ROUTES):
     master, log = tmp_path / "master.jsonl", tmp_path / "log.jsonl"
-    done = review_all(DOCS, PREDS, routes, cfg, "proj", llm, master, log, **NO_SLEEP)
+    done = review_all(DOCS, PREDS, routes, cfg, "proj", llm, master, log)
     return done, read_jsonl(master), read_jsonl(log)
 
 
@@ -73,7 +72,7 @@ def test_review_all_statuses_and_master_fields(tmp_path):
     for r in master:
         assert validate_record(r, CFG["labels"]) == []
         assert (r["labels"], r["schema_version"], r["model_version"], r["label_source"]) == (
-            CFG["labels"], CFG["schema_version"], CFG["active_model"], "gemini")
+            CFG["labels"], CFG["schema_version"], CFG["active_model"], "llm")
     by_text = {r["text"]: r for r in master}
     assert by_text[DOCS["a"]]["route_reason"] == "low_score"
     assert by_text[DOCS["a"]]["entities"] == [[0, 7, "tokoh"], [16, 21, "tokoh"]]
@@ -97,30 +96,28 @@ def test_conflict_not_in_master(tmp_path):
     assert master == [] and log[0]["status"] == "conflict"
 
 
-def test_quota_stop_then_resume_without_duplicates(tmp_path):
-    cfg = {**CFG, "ai_workers": 1}
-    llm = FakeLLM(ANSWERS, quota_after=1)
-    done, master, log = run(tmp_path, llm, cfg)
-    assert not done and len(log) == 2                     # batch pertama tersimpan, batch kedua kena kuota
+def test_budget_stop_then_resume_without_duplicates(tmp_path):
+    llm = FakeLLM(ANSWERS)
+    done, master, log = run(tmp_path, llm, {**CFG, "llm_budget_per_run": 2})
+    assert not done and len(log) == 2 and len(llm.calls) == 1   # satu batch, lalu berhenti
     llm2 = FakeLLM(ANSWERS)
-    done, master, log = run(tmp_path, llm2, cfg)
+    done, master, log = run(tmp_path, llm2)
     assert done and len(llm2.calls) == 1                  # hanya batch yang belum selesai dikirim
     assert sorted(r["doc_id"] for r in log) == ["a", "b", "c", "d"]
     assert len(master) == len({r["doc_id"] for r in master}) == 3
-    done, _, _ = run(tmp_path, FakeLLM(ANSWERS, quota_after=0), cfg)
-    assert done                                           # semua final, tidak ada panggilan
+    llm3 = FakeLLM(ANSWERS)
+    assert run(tmp_path, llm3)[0] and llm3.calls == []    # semua final, tidak ada panggilan
 
 
 def test_parse_fail_splits_then_marks_failed(tmp_path):
-    cfg = {**CFG, "batch_size": 4, "ai_workers": 1}
+    cfg = {**CFG, "batch_size": 4}
     llm = FakeLLM(ANSWERS, broken=[DOCS["d"]])
     done, master, log = run(tmp_path, llm, cfg)
     assert done
-    # 2x gagal sebagai batch 4 doc, lalu sendiri-sendiri: a,b,c lolos, d gagal ke-3 -> failed
-    # 2 putaran x 2 retry sebagai batch 4 doc, lalu a,b,c sekali, d 2 retry
-    assert [len(c) for c in llm.calls] == [4, 4, 4, 4, 1, 1, 1, 1, 1]
+    # gagal sebagai batch 4 doc, lalu sendiri-sendiri: a,b,c lolos, d gagal lagi -> failed
+    assert [len(c) for c in llm.calls] == [4, 1, 1, 1, 1]
     last = {r["doc_id"]: r for r in log}
-    assert last["d"]["status"] == "failed" and last["d"]["attempts"] == 3
+    assert last["d"]["status"] == "failed" and last["d"]["attempts"] == 2
     assert {last[d]["status"] for d in "abc"} == {"ok"}
     assert len(master) == 3
     llm2 = FakeLLM(ANSWERS)
@@ -133,60 +130,43 @@ def test_compare_entities_drop():
         "kept": 1, "dropped": 1, "added": 0}
 
 
-class MinuteLimitLLM(FakeLLM):
-    """Kena limit per menit sekali, lalu normal lagi."""
-    def __call__(self, prompt):
-        if not getattr(self, "hit", False):
-            self.hit = True
-            raise RuntimeError("429 RESOURCE_EXHAUSTED Quota: GenerateRequestsPerMinutePerProjectPerModel")
-        return super().__call__(prompt)
-
-
-def test_minute_limit_waits_then_continues(tmp_path):
-    waits = []
-    master, log = tmp_path / "m.jsonl", tmp_path / "l.jsonl"
-    done = review_all(DOCS, PREDS, ROUTES, CFG, "p", MinuteLimitLLM(ANSWERS), master, log,
-                      sleep=waits.append, sleep_between=0)
-    assert done and 60 in waits and len(read_jsonl(log)) == 4
-
-
-def test_daily_quota_stops_without_waiting(tmp_path):
-    def daily_llm(prompt):
-        raise RuntimeError("429 RESOURCE_EXHAUSTED Quota: GenerateRequestsPerDayPerProjectPerModel-FreeTier")
-    waits = []
-    done = review_all(DOCS, PREDS, ROUTES, CFG, "p", daily_llm, tmp_path / "m.jsonl", tmp_path / "l.jsonl",
-                      sleep=waits.append, sleep_between=0)
-    assert not done and 60 not in waits
-
-
 def test_budget_and_low_score_priority(tmp_path):
     docs = {f"d{i}": f"Prabowo bertemu Putin {i}" for i in range(4)}
     preds = {f"d{i}": [[0, 7, "tokoh", s]] for i, s in enumerate([0.5, 0.2, 0.4, 0.3])}
     routes = {d: "low_score" for d in docs}
     answers = {t: {"tokoh": ["Prabowo"]} for t in docs.values()}
     llm = FakeLLM(answers)
-    cfg = {**CFG, "batch_size": 1, "ai_workers": 1, "llm_budget_per_run": 2}
-    done = review_all(docs, preds, routes, cfg, "p", llm, tmp_path / "m.jsonl", tmp_path / "l.jsonl", **NO_SLEEP)
+    cfg = {**CFG, "batch_size": 1, "llm_budget_per_run": 2}
+    done = review_all(docs, preds, routes, cfg, "p", llm, tmp_path / "m.jsonl", tmp_path / "l.jsonl")
     assert not done
     assert [c[0] for c in llm.calls] == [docs["d1"], docs["d3"]]   # skor terendah dulu, maksimal 2 doc
 
 
-def test_make_generate_needs_key_and_uses_json_mode(monkeypatch):
-    from google import genai
+def test_answer_schema_requires_every_label():
+    from ner.llm import answer_schema
+    item = answer_schema(["tokoh", "lokasi"])["items"]
+    assert item["required"] == ["index", "entities"]
+    assert item["properties"]["entities"]["required"] == ["tokoh", "lokasi"]
+
+
+def test_make_generate_loads_gguf_and_forces_json(monkeypatch):
     from ner.llm import make_generate
-    with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
-        make_generate(CFG, api_key=None)
     seen = {}
 
-    class FakeClient:
-        def __init__(self, api_key):
-            seen["key"] = api_key
-            self.models = self
+    class FakeLlama:
+        @classmethod
+        def from_pretrained(cls, **kw):
+            seen["load"] = kw
+            return cls()
 
-        def generate_content(self, model, contents, config):
-            seen.update(model=model, mime=config.response_mime_type)
-            return type("R", (), {"text": "[]"})()
+        def create_chat_completion(self, messages, response_format, temperature, max_tokens):
+            seen.update(prompt=messages[0]["content"], fmt=response_format["type"], temperature=temperature,
+                        max_tokens=max_tokens, labels=response_format["schema"]["items"]["properties"]["entities"]["required"])
+            return {"choices": [{"message": {"content": "[]"}}]}
 
-    monkeypatch.setattr(genai, "Client", FakeClient)
-    assert make_generate(CFG, api_key="k")("halo") == "[]"
-    assert seen == {"key": "k", "model": "gemini-2.5-flash", "mime": "application/json"}
+    monkeypatch.setitem(sys.modules, "llama_cpp", types.SimpleNamespace(Llama=FakeLlama))
+    assert make_generate(CFG)("halo") == "[]"
+    assert seen["load"] == {"repo_id": CFG["llm_model_repo"], "filename": CFG["llm_model_file"],
+                            "n_ctx": CFG["llm_n_ctx"], "n_gpu_layers": -1, "verbose": False}
+    assert (seen["prompt"], seen["fmt"], seen["temperature"], seen["labels"]) == ("halo", "json_object", 0, CFG["labels"])
+    assert seen["max_tokens"] == 150 * CFG["batch_size"] + 200
